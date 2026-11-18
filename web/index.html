@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Target Frenzy – Leaderboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700&family=Barlow:wght@500&family=Rye&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Target Frenzy</h1>
+  <p id="status">Loading scores…</p>
+</header>
+
+<main>
+  <p id="summary" class="summary">Fetching the scoreboard…</p>
+
+  <div class="columns">
+    <section class="panel">
+      <h2>All-time top 10</h2>
+      <ol id="top" class="list"></ol>
+    </section>
+
+    <section class="panel">
+      <h2>Latest games</h2>
+      <ol id="recent" class="list compact"></ol>
+    </section>
+  </div>
+</main>
+
+<footer>Scores arrive here a few seconds after each game at the booth.</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

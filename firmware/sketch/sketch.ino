@@ -98,6 +98,13 @@ const int MAX_NAME_LEN = 12;
 // (Must stay ABOVE every function: Arduino IDE adds hidden function
 //  declarations before the first function, and they need to know "Button".)
 // =====================================================================
+// A saved game, as read back from flash (defined up here for Arduino's hidden declarations)
+struct SavedGame {
+  char id[12]; char name[MAX_NAME_LEN + 4];
+  int sc, r1, r2, r3, sh, ht, s1, s2, s3, h1, h2, h3, react, missed;
+  bool extra;   // true = has the Step 2 data (older games don't)
+};
+
 // Leaderboard entry (defined up here so Arduino's hidden function declarations know it)
 struct Entry { char id[12]; char name[MAX_NAME_LEN + 1]; int score; int shots; int hits; int num; };
 struct Button { int pin; bool stable; bool lastRead; unsigned long changedAt; bool pressed; };
@@ -180,6 +187,20 @@ int lastSecondShown = -1;
 int score = 0;
 int roundScores[NUM_ROUNDS] = {0, 0, 0};
 int shots = 0, hits = 0;
+// Extra gameplay data for the Intelligent System features (Step 2)
+int roundShots[NUM_ROUNDS] = {0, 0, 0};
+int roundHits[NUM_ROUNDS]  = {0, 0, 0};
+unsigned long reactionSum = 0;   // total ms from "target up" to "hit"
+int reactionCount = 0;
+int targetsMissed = 0;           // targets that went down without being hit
+
+int avgReactionMs() { return reactionCount ? (int)(reactionSum / reactionCount) : 0; }
+
+void resetStats() {
+  score = 0; shots = 0; hits = 0;
+  for (int r = 0; r < NUM_ROUNDS; r++) { roundScores[r] = 0; roundShots[r] = 0; roundHits[r] = 0; }
+  reactionSum = 0; reactionCount = 0; targetsMissed = 0;
+}
 int hitSeq = 0, lastHitTarget = -1, lastHitPoints = 0;
 char gameId[12] = "";
 char lastSavedId[12] = "";
@@ -250,6 +271,7 @@ void fireShot() {
     ammo--;
   }
   shots++;
+  roundShots[currentRound]++;
   digitalWrite(LASER_PIN, HIGH);
   laserOn = true;
   shotScored = false;
@@ -330,10 +352,14 @@ void registerHit(int i) {
   score += pts;
   roundScores[currentRound] += pts;
   hits++;
+  roundHits[currentRound]++;
+  unsigned long reaction = millis() - tStart[i];   // how fast the player hit it after it popped up
+  reactionSum += reaction;
+  reactionCount++;
   hitSeq++;
   lastHitTarget = i;
   lastHitPoints = pts;
-  Serial.printf("Target %d HIT! +%d | Score: %d\n", i + 1, pts, score);
+  Serial.printf("Target %d HIT! +%d | Score: %d | reaction %lu ms\n", i + 1, pts, score, reaction);
   PLAY(SND_HIT);
   setTarget(i, false);
   scheduleTarget(i);
@@ -358,6 +384,7 @@ void handleTarget(int i) {
     case T_UP: {
       unsigned long upFor = now - tStart[i];
       if (upFor >= targetUpMs[currentRound]) {   // missed: timed out
+        targetsMissed++;
         setTarget(i, false);
         scheduleTarget(i);
         break;
@@ -388,8 +415,7 @@ void handleTarget(int i) {
 // GAME FLOW
 // =====================================================================
 void startNewGame() {
-  score = 0; shots = 0; hits = 0;
-  for (int r = 0; r < NUM_ROUNDS; r++) roundScores[r] = 0;
+  resetStats();
   lastHitTarget = -1; lastHitPoints = 0;
   snprintf(gameId, sizeof(gameId), "%08lx", (unsigned long)esp_random());
   allTargetsDown();   // targets lie down when START is pressed
@@ -422,6 +448,12 @@ void endRound() {
     gameStateStart = millis();
     PLAY(SND_GAMEOVER);
     Serial.printf("=== GAME OVER ===  Final Score: %d\n", score);
+    Serial.println("--- Game summary (data for the AI features) ---");
+    for (int r = 0; r < NUM_ROUNDS; r++) {
+      Serial.printf("  Round %d: %2d hits / %3d shots = %3d%% accuracy, %d points\n", r + 1,
+                    roundHits[r], roundShots[r], roundShots[r] ? 100 * roundHits[r] / roundShots[r] : 0, roundScores[r]);
+    }
+    Serial.printf("  Avg reaction time: %d ms | Targets missed: %d\n", avgReactionMs(), targetsMissed);
     Serial.println("Waiting for the player's name on the dashboard...");
     Serial.println("(Backup: type a name here in the Serial Monitor and press Enter)");
   } else {
@@ -436,8 +468,7 @@ void resetGame() {
   allTargetsUp();     // idle = targets standing
   laserOff();
   reloading = false;
-  score = 0; shots = 0; hits = 0;
-  for (int r = 0; r < NUM_ROUNDS; r++) roundScores[r] = 0;
+  resetStats();
   gameState = WAITING;
   PLAY(SND_RESET);
   Serial.println("Game reset. Waiting for next player to press START...");
@@ -542,11 +573,28 @@ String cleanName(String raw) {
   return out;
 }
 
+// Saved line: id,score,r1,r2,r3,shots,hits,shots1,shots2,shots3,hits1,hits2,hits3,avgReactionMs,missed,name
 String resultLine(const char* id, const String& name) {
-  char buf[96];
-  snprintf(buf, sizeof(buf), "%s,%d,%d,%d,%d,%d,%d,%s\n", id, score,
-           roundScores[0], roundScores[1], roundScores[2], shots, hits, name.c_str());
+  char buf[160];
+  snprintf(buf, sizeof(buf), "%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s\n", id, score,
+           roundScores[0], roundScores[1], roundScores[2], shots, hits,
+           roundShots[0], roundShots[1], roundShots[2], roundHits[0], roundHits[1], roundHits[2],
+           avgReactionMs(), targetsMissed, name.c_str());
   return String(buf);
+}
+
+// Reads a saved line in the new (16-field) or the old (8-field) format.
+bool parseSavedLine(const String& line, SavedGame& g) {
+  g.extra = sscanf(line.c_str(), "%11[^,],%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%15[^\r\n]",
+                   g.id, &g.sc, &g.r1, &g.r2, &g.r3, &g.sh, &g.ht, &g.s1, &g.s2, &g.s3,
+                   &g.h1, &g.h2, &g.h3, &g.react, &g.missed, g.name) == 16;
+  if (!g.extra) {
+    if (sscanf(line.c_str(), "%11[^,],%d,%d,%d,%d,%d,%d,%15[^\r\n]",
+               g.id, &g.sc, &g.r1, &g.r2, &g.r3, &g.sh, &g.ht, g.name) != 8) return false;
+    g.s1 = g.s2 = g.s3 = g.h1 = g.h2 = g.h3 = g.react = g.missed = 0;
+  }
+  g.name[MAX_NAME_LEN] = 0;
+  return true;
 }
 
 void appendToFile(const char* path, const String& line) {
@@ -595,13 +643,11 @@ void loadScores() {
   if (f) {
     while (f.available()) {
       String l = f.readStringUntil('\n');
-      char id[12], name[MAX_NAME_LEN + 4];
-      int sc, r1, r2, r3, sh, ht;
-      if (sscanf(l.c_str(), "%11[^,],%d,%d,%d,%d,%d,%d,%15[^\r\n]", id, &sc, &r1, &r2, &r3, &sh, &ht, name) == 8) {
-        name[MAX_NAME_LEN] = 0;
+      SavedGame g;
+      if (parseSavedLine(l, g)) {
         totalGames++;
-        addToTop(id, name, sc, sh, ht, totalGames);
-        addRecent(id, name, sc, sh, ht, totalGames);
+        addToTop(g.id, g.name, g.sc, g.sh, g.ht, totalGames);
+        addRecent(g.id, g.name, g.sc, g.sh, g.ht, totalGames);
       }
     }
     f.close();
@@ -619,13 +665,13 @@ bool supabaseConfigured() {
 
 // Returns true if the line is done (uploaded, duplicate, or broken).
 bool uploadLine(const String& line) {
-  char id[12], name[MAX_NAME_LEN + 4];
-  int sc, r1, r2, r3, sh, ht;
-  if (sscanf(line.c_str(), "%11[^,],%d,%d,%d,%d,%d,%d,%15[^\r\n]", id, &sc, &r1, &r2, &r3, &sh, &ht, name) != 8) {
+  SavedGame g;
+  if (!parseSavedLine(line, g)) {
     Serial.println("Skipping a broken saved line.");
     return true;
   }
-  name[MAX_NAME_LEN] = 0;
+  const char* name = g.name;
+  int sc = g.sc;
 
   WiFiClientSecure client;
   client.setInsecure();   // OK for a school project; skips certificate checking
@@ -644,11 +690,18 @@ bool uploadLine(const String& line) {
     http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
   }
 
-  char body[256];
-  snprintf(body, sizeof(body),
+  char body[480];
+  int n = snprintf(body, sizeof(body),
            "{\"game_id\":\"%s\",\"player_name\":\"%s\",\"score\":%d,"
-           "\"round1\":%d,\"round2\":%d,\"round3\":%d,\"shots\":%d,\"hits\":%d}",
-           id, name, sc, r1, r2, r3, sh, ht);
+           "\"round1\":%d,\"round2\":%d,\"round3\":%d,\"shots\":%d,\"hits\":%d",
+           g.id, g.name, g.sc, g.r1, g.r2, g.r3, g.sh, g.ht);
+  if (g.extra) {   // Step 2 data (games played before this update don't have it)
+    n += snprintf(body + n, sizeof(body) - n,
+           ",\"shots_r1\":%d,\"shots_r2\":%d,\"shots_r3\":%d,\"hits_r1\":%d,\"hits_r2\":%d,\"hits_r3\":%d,"
+           "\"avg_reaction_ms\":%d,\"targets_missed\":%d",
+           g.s1, g.s2, g.s3, g.h1, g.h2, g.h3, g.react, g.missed);
+  }
+  snprintf(body + n, sizeof(body) - n, "}");
 
   int code = http.POST((uint8_t*)body, strlen(body));
   String resp = (code > 0) ? http.getString() : "";
@@ -666,6 +719,7 @@ bool uploadLine(const String& line) {
   if (code == 401) Serial.println("  -> Check SUPABASE_KEY.");
   if (code == 404) Serial.println("  -> Check SUPABASE_URL and that the table is named 'scores'.");
   if (code == 403 || resp.indexOf("42501") >= 0) Serial.println("  -> Run the SQL policy step in the guide.");
+  if (code == 400 && resp.indexOf("column") >= 0) Serial.println("  -> New columns missing: run supabase_step2.sql in Supabase.");
   return false;
 }
 

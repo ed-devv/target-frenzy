@@ -90,34 +90,6 @@ const unsigned long minPauseMs[NUM_ROUNDS]       = {500,  400,  300};  // shorte
 const unsigned long maxPauseMs[NUM_ROUNDS]       = {2000, 1500, 750};  // longest wait before popping up
 const unsigned long HIT_COOLDOWN_MS = 1500;  // after a HIT, that target stays down at least this long (1 hit per pop-up)
 
-// --- IS Feature 2: Smart Target Selector (greedy best-first search) ---
-// true  = the game SEARCHES for the best target to raise next (heuristic below)
-// false = old behaviour: every target pops up on its own random timer
-const bool SMART_SELECTOR = true;
-const int  maxUpPerRound[NUM_ROUNDS] = {1, 2, 2};   // how many targets may stand at once
-// Heuristic weights:  h = W_DIST*distance + W_WAIT*waiting + W_MISS*missRate (+ tiny random tie-break)
-const float W_DIST = 0.40;   // prefer targets that need a BIG TURN of the gun from the last hit
-const float W_WAIT = 0.30;   // prefer targets that have been DOWN the longest -> fair spread
-const float W_MISS = 0.30;   // prefer targets this player MISSES most -> practise weak spots
-// Where each target stands, measured from the player's shooting spot (cm).
-//   x = left (-) / right (+) of the player,  y = straight-ahead distance from the player
-// Your booth: T1 front-left, T2 middle and farther back, T3 front-right. MEASURE and update these.
-const float targetX[NUM_TARGETS] = {-30.0, 0.0, 30.0};
-const float targetY[NUM_TARGETS] = {150.0, 200.0, 150.0};
-const unsigned long WAIT_FULL_MS = 4000;   // waiting time that counts as "fully waited" (score 1.0)
-const bool SHOW_SEARCH = true;             // print each search decision in the Serial Monitor
-
-// --- IS Feature 1: Adaptive Difficulty Engine (Sugeno fuzzy logic, 9 rules) ---
-// Inputs : hit rate  = targets hit / targets shown (last FUZZY_WINDOW targets)
-//          reaction  = average ms from "target up" to "hit" (same window)
-// Output : -1 (easier) .. 0 (same) .. +1 (harder)
-// Effect : targets stay up and pause for (1 - DIFF_STRENGTH x output) x normal time
-const bool  ADAPTIVE_DIFFICULTY = true;
-const int   FUZZY_WINDOW   = 6;      // judge the player on their last 6 targets
-const int   FUZZY_MIN_DATA = 3;      // need at least 3 targets before adapting
-const float DIFF_STRENGTH  = 0.30;   // output +1 -> 30% less time, -1 -> 30% more time
-const bool  SHOW_FUZZY = true;       // print each fuzzy decision in the Serial Monitor
-
 const int LEADERBOARD_SIZE = 10;
 const int MAX_NAME_LEN = 12;
 
@@ -245,20 +217,6 @@ Servo targetServos[NUM_TARGETS];
 TargetState tState[NUM_TARGETS];
 unsigned long tStart[NUM_TARGETS];
 unsigned long tPause[NUM_TARGETS];
-// Smart Target Selector memory (per game)
-unsigned long downSince[NUM_TARGETS];      // when each target last went down
-unsigned long cooldownUntil[NUM_TARGETS];  // a just-hit target may not be picked before this
-int timesUp[NUM_TARGETS];                  // how often this player saw each target
-int timesHit[NUM_TARGETS];                 // how often this player hit each target
-int lastRaised = -1;
-unsigned long nextSpawnAt = 0;
-
-// Adaptive Difficulty memory (per game)
-bool  winHit[FUZZY_WINDOW];          // last targets: hit (true) or missed (false)
-unsigned long winReact[FUZZY_WINDOW];
-int   winCount = 0, winPos = 0;
-float difficulty = 0;                // fuzzy output, -1..+1
-float speedFactor = 1.0;             // multiplies target time and pause time
 int baseline[NUM_TARGETS];
 
 // Leaderboard (top 10 kept in RAM, everything kept in flash)
@@ -369,142 +327,9 @@ void setTarget(int i, bool up) {
 }
 
 void scheduleTarget(int i) {
-  if (SMART_SELECTOR) {            // stay down; the search decides when/which target rises
-    tState[i] = T_IDLE;
-    downSince[i] = millis();
-    unsigned long gap = millis() + (unsigned long)(minPauseMs[currentRound] * speedFactor);   // short breather
-    if ((long)(nextSpawnAt - gap) < 0) nextSpawnAt = gap;
-    return;
-  }
   tState[i] = T_WAIT;
   tStart[i] = millis();
-  tPause[i] = randomPauseMs();
-}
-
-void raiseTarget(int i) {
-  setTarget(i, true);
-  tState[i] = T_UP;
-  tStart[i] = millis();
-  baseline[i] = -1;
-  timesUp[i]++;
-  lastRaised = i;
-}
-
-// How far the player must turn the gun between two targets (degrees)
-float aimAngle(int i) { return atan2f(targetX[i], targetY[i]) * 57.2958f; }
-float turnBetween(int a, int b) { return fabsf(aimAngle(a) - aimAngle(b)); }
-float maxTurn() {                      // biggest turn between any two targets (for scaling 0..1)
-  float m = 0.001f;
-  for (int a = 0; a < NUM_TARGETS; a++) for (int b = a + 1; b < NUM_TARGETS; b++) m = fmaxf(m, turnBetween(a, b));
-  return m;
-}
-
-// ======================= Fuzzy logic helpers =======================
-// Trapezoid membership: 0 below a, rises a->b, 1 from b to c, falls c->d, 0 above d
-float trap(float x, float a, float b, float c, float d) {
-  if (x < a || x > d) return 0;
-  if (x >= b && x <= c) return 1;
-  if (x < b) return (b > a) ? (x - a) / (b - a) : 1;
-  return (d > c) ? (d - x) / (d - c) : 1;
-}
-
-void resetDifficulty() {
-  winCount = 0; winPos = 0; difficulty = 0; speedFactor = 1.0;
-}
-
-// Called every time a target goes down (hit or missed): update the fuzzy difficulty
-void recordOutcome(bool hit, unsigned long reactMs) {
-  winHit[winPos] = hit;
-  winReact[winPos] = reactMs;
-  winPos = (winPos + 1) % FUZZY_WINDOW;
-  if (winCount < FUZZY_WINDOW) winCount++;
-  if (!ADAPTIVE_DIFFICULTY || winCount < FUZZY_MIN_DATA) return;
-
-  // 1) Crisp inputs from the last few targets
-  int nHit = 0; unsigned long sumR = 0;
-  for (int k = 0; k < winCount; k++) if (winHit[k]) { nHit++; sumR += winReact[k]; }
-  float hitRate  = 100.0f * nHit / winCount;                    // %
-  float reaction = nHit ? (float)sumR / nHit : 2500.0f;          // no hits = treat as very slow
-
-  // 2) Fuzzify (membership functions from Figure 2-A)
-  float acc[3] = { trap(hitRate, 0, 0, 20, 45),       // Low
-                   trap(hitRate, 25, 50, 50, 75),     // Medium
-                   trap(hitRate, 55, 80, 100, 100) }; // High
-  float rea[3] = { trap(reaction, 1100, 1600, 1e9, 1e9),    // Slow
-                   trap(reaction, 500, 1000, 1000, 1500),   // Average
-                   trap(reaction, 0, 0, 400, 900) };        // Fast
-
-  // 3) Rule base (9 rules): rows = accuracy Low/Med/High, cols = reaction Slow/Avg/Fast
-  //    -1 = Easier, 0 = Same, +1 = Harder
-  const int RULE[3][3] = { {-1, -1,  0},
-                           {-1,  0,  1},
-                           { 0,  1,  1} };
-  // 4) Inference (AND = min) + Sugeno weighted average
-  float num = 0, den = 0;
-  for (int a = 0; a < 3; a++) for (int r = 0; r < 3; r++) {
-    float w = fminf(acc[a], rea[r]);
-    num += w * RULE[a][r];
-    den += w;
-  }
-  difficulty = den > 0 ? num / den : 0;
-  speedFactor = 1.0f - DIFF_STRENGTH * difficulty;
-
-  if (SHOW_FUZZY) {
-    Serial.printf("[FUZZY] hit rate %.0f%% (Low %.2f Med %.2f High %.2f) | reaction %.0f ms (Slow %.2f Avg %.2f Fast %.2f)\n",
-                  hitRate, acc[0], acc[1], acc[2], reaction, rea[0], rea[1], rea[2]);
-    Serial.printf("        output %+.2f -> %s, targets stay up %d ms (x%.2f)\n", difficulty,
-                  difficulty > 0.15 ? "HARDER" : (difficulty < -0.15 ? "EASIER" : "SAME"),
-                  (int)(targetUpMs[currentRound] * speedFactor), speedFactor);
-  }
-}
-
-unsigned long currentUpMs()   { return (unsigned long)(targetUpMs[currentRound] * speedFactor); }
-unsigned long randomPauseMs() {
-  return (unsigned long)(randomBetween(minPauseMs[currentRound], maxPauseMs[currentRound]) * speedFactor);
-}
-
-void resetSelector() {
-  for (int i = 0; i < NUM_TARGETS; i++) {
-    downSince[i] = millis(); cooldownUntil[i] = 0; timesUp[i] = 0; timesHit[i] = 0;
-  }
-  lastRaised = -1;
-}
-
-// ---- IS Feature 2: greedy best-first search over the targets that are down ----
-// Frontier = targets that are down and not cooling down after a hit.
-// Each one gets a heuristic score h; the target with the highest h is raised.
-void smartSpawn() {
-  unsigned long now = millis();
-  if ((long)(now - nextSpawnAt) < 0) return;
-
-  int up = 0;
-  for (int i = 0; i < NUM_TARGETS; i++) if (tState[i] == T_UP) up++;
-  if (up >= maxUpPerRound[currentRound]) return;   // enough targets standing; check again soon
-
-  int ref = (lastHitTarget >= 0) ? lastHitTarget : lastRaised;   // where the player is aiming now
-  int best = -1;
-  float bestH = -1;
-  if (SHOW_SEARCH) Serial.print("[SEARCH]");
-  for (int i = 0; i < NUM_TARGETS; i++) {
-    if (tState[i] == T_UP || (long)(now - cooldownUntil[i]) < 0) continue;   // not in the frontier
-
-    float dist = (ref < 0) ? 0.5f : turnBetween(i, ref) / maxTurn();   // 0 = same aim, 1 = biggest turn
-    unsigned long waited = now - downSince[i];
-    float wait = waited >= WAIT_FULL_MS ? 1.0f : (float)waited / WAIT_FULL_MS;
-    float miss = (float)(timesUp[i] - timesHit[i] + 1) / (timesUp[i] + 2);   // smoothed miss rate (0.5 when unknown)
-    float h = W_DIST * dist + W_WAIT * wait + W_MISS * miss + (esp_random() % 100) / 2000.0f;   // +0..0.05 tie-break
-
-    if (SHOW_SEARCH) Serial.printf("  T%d h=%.2f (turn %.2f, wait %.2f, miss %.2f)", i + 1, h, dist, wait, miss);
-    if (h > bestH) { bestH = h; best = i; }
-  }
-  if (best < 0) {                      // every target is up or cooling down
-    if (SHOW_SEARCH) Serial.println("  -> none ready");
-    nextSpawnAt = now + 150;
-    return;
-  }
-  if (SHOW_SEARCH) Serial.printf("  -> raise T%d\n", best + 1);
-  raiseTarget(best);
-  nextSpawnAt = now + randomPauseMs();
+  tPause[i] = randomBetween(minPauseMs[currentRound], maxPauseMs[currentRound]);
 }
 
 void allTargetsDown() {
@@ -535,13 +360,10 @@ void registerHit(int i) {
   lastHitTarget = i;
   lastHitPoints = pts;
   Serial.printf("Target %d HIT! +%d | Score: %d | reaction %lu ms\n", i + 1, pts, score, reaction);
-  recordOutcome(true, reaction);   // feed the fuzzy difficulty engine
   PLAY(SND_HIT);
   setTarget(i, false);
   scheduleTarget(i);
   if (tPause[i] < HIT_COOLDOWN_MS) tPause[i] = HIT_COOLDOWN_MS;   // cooldown: no instant pop-up into the same beam
-  cooldownUntil[i] = millis() + HIT_COOLDOWN_MS;
-  timesHit[i]++;
 }
 
 void handleTarget(int i) {
@@ -551,14 +373,18 @@ void handleTarget(int i) {
       break;
 
     case T_WAIT:
-      if (now - tStart[i] >= tPause[i]) raiseTarget(i);
+      if (now - tStart[i] >= tPause[i]) {
+        setTarget(i, true);
+        tState[i] = T_UP;
+        tStart[i] = now;
+        baseline[i] = -1;
+      }
       break;
 
     case T_UP: {
       unsigned long upFor = now - tStart[i];
-      if (upFor >= currentUpMs()) {   // missed: timed out
+      if (upFor >= targetUpMs[currentRound]) {   // missed: timed out
         targetsMissed++;
-        recordOutcome(false, 0);
         setTarget(i, false);
         scheduleTarget(i);
         break;
@@ -591,8 +417,6 @@ void handleTarget(int i) {
 void startNewGame() {
   resetStats();
   lastHitTarget = -1; lastHitPoints = 0;
-  resetSelector();
-  resetDifficulty();   // every player starts at normal difficulty
   snprintf(gameId, sizeof(gameId), "%08lx", (unsigned long)esp_random());
   allTargetsDown();   // targets lie down when START is pressed
   gameState = COUNTDOWN;
@@ -608,7 +432,6 @@ void beginRound(int r) {
   emptyWarned = false;
   lastShotAt = millis();
   for (int i = 0; i < NUM_TARGETS; i++) scheduleTarget(i);
-  nextSpawnAt = millis() + 300;   // first target rises 0.3 s after GO
   gameState = ROUND;
   gameStateStart = millis();
   lastSecondShown = -1;
@@ -675,7 +498,6 @@ void updateGame() {
 
     case ROUND: {
       for (int i = 0; i < NUM_TARGETS; i++) handleTarget(i);
-      if (SMART_SELECTOR) smartSpawn();
       unsigned long el = millis() - gameStateStart;
       int left = (el >= ROUND_MS) ? 0 : (int)((ROUND_MS - el + 999) / 1000);
       if (left != lastSecondShown && left > 0) {
@@ -1112,7 +934,7 @@ h2.list-title{font:700 26px/1.1 "Barlow Condensed",sans-serif;margin-bottom:14px
         <span class="ammo-label">Ammo<b id="ammoCount"></b></span>
         <div id="ammo" class="ammo"></div>
       </div>
-      <p class="minor"><span>Hits<b id="hits">0</b></span><span>Accuracy<b id="acc">–</b></span><span>Difficulty<b id="diff">Normal</b></span></p>
+      <p class="minor"><span>Hits<b id="hits">0</b></span><span>Accuracy<b id="acc">–</b></span></p>
     </section>
 
     <aside class="panel board">
@@ -1257,11 +1079,6 @@ function render(s){
 
   $('hits').textContent=s.hits;
   $('acc').textContent=s.shots?Math.round(100*s.hits/s.shots)+'%':'–';
-  // AI difficulty (fuzzy engine): shown while a game is running
-  if(typeof s.diff==='number'){
-    const lvl=s.diff>0.15?'Harder':s.diff<-0.15?'Easier':'Normal';
-    $('diff').textContent=(s.state==='WAITING')?'Normal':lvl+' ×'+s.speed.toFixed(2);
-  }
 
   const lis=$('targets').children;
   for(let i=0;i<lis.length;i++){if(!lis[i].classList.contains('hit'))lis[i].className=s.targets[i]?'up':''}
@@ -1391,14 +1208,13 @@ void handleState() {
     "{\"state\":\"%s\",\"round\":%d,\"rounds\":%d,\"roundMs\":%lu,\"score\":%d,\"timeLeft\":%ld,\"countdown\":%d,"
     "\"ammo\":%d,\"mag\":%d,\"reloading\":%s,\"shots\":%d,\"hits\":%d,\"hitSeq\":%d,"
     "\"lastHitTarget\":%d,\"lastHitPts\":%d,\"targets\":[%d,%d,%d],"
-    "\"firing\":%s,\"holdFire\":%s,\"fireMs\":%lu,\"reloadMs\":%lu,\"diff\":%.2f,\"speed\":%.2f,"
+    "\"firing\":%s,\"holdFire\":%s,\"fireMs\":%lu,\"reloadMs\":%lu,"
     "\"wifi\":%s,\"pending\":%d,\"lastId\":\"%s\"}",
     stateName(), currentRound + 1, NUM_ROUNDS, ROUND_MS, score, timeLeft, countdown,
     ammo, USE_AMMO ? MAG_SIZE : 0, reloading ? "true" : "false", shots, hits, hitSeq,
     lastHitTarget, lastHitPoints,
     tState[0] == T_UP, tState[1] == T_UP, tState[2] == T_UP,
     firing ? "true" : "false", (AUTO_FIRE || HOLD_TO_FIRE) ? "true" : "false", FIRE_INTERVAL_MS, RELOAD_MS,
-    difficulty, speedFactor,
     WiFi.status() == WL_CONNECTED ? "true" : "false", pendingCount, lastSavedId);
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", buf);

@@ -1,0 +1,12 @@
+# Private settings (hotspot password, keys)
+firmware/sketch/secrets.h
+secrets.h
+
+# Arduino build files
+build/
+*.bin
+*.elf
+
+# OS junk
+.DS_Store
+Thumbs.db

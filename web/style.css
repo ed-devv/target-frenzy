@@ -206,3 +206,17 @@ footer {
   font-size: 14px;
   color: #ffe1dc;
 }
+
+/* K-Means skill tag (IS Feature 3) */
+.tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 5px;
+  font-size: 0.78em;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.tag.Beginner { background: #3b2f29; color: #e9d9cd; }
+.tag.Sharpshooter { background: #6b4f0a; color: #ffe08a; }
+.tag.Pro { background: var(--bulb); color: var(--ink); }

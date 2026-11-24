@@ -3,8 +3,8 @@
 // =====================================================================
 //  SETTINGS YOU MUST CHANGE  (the same values you put in sketch.ino)
 // =====================================================================
-const SUPABASE_URL = "https://xgucrsnfjbnxbgdgnjvk.supabase.co";
-const SUPABASE_KEY = "sb_publishable_APHNcWA-bZKF4jFbgBej4g_ZCgqEX5j";
+const SUPABASE_URL = "https://YOUR-PROJECT-ID.supabase.co";
+const SUPABASE_KEY = "YOUR_SUPABASE_PUBLISHABLE_OR_ANON_KEY";
 const REFRESH_SECONDS = 5;   // how often the page checks for new scores
 
 const $ = id => document.getElementById(id);
@@ -40,6 +40,14 @@ function item(r, opts) {
   const sub = document.createElement("span");
   sub.className = "sub";
   sub.textContent = opts.sub;
+  if (r.skill) {
+    // IS Feature 3: K-Means skill group saved with the game
+    const tag = document.createElement("span");
+    tag.className = "tag " + r.skill;
+    tag.textContent = r.skill;
+    sub.appendChild(document.createTextNode(" · "));
+    sub.appendChild(tag);
+  }
   nm.appendChild(sub);
   li.appendChild(nm);
 
@@ -64,7 +72,7 @@ function accuracy(r) {
 
 async function refresh() {
   try {
-    const cols = "id,player_name,score,shots,hits,created_at";
+    const cols = "id,player_name,score,shots,hits,skill,created_at";
     const [topRes, recentRes, countRes] = await Promise.all([
       query("scores?select=" + cols + "&order=score.desc,created_at.asc&limit=10"),
       query("scores?select=" + cols + "&order=created_at.desc&limit=8"),

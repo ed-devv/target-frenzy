@@ -86,6 +86,12 @@ const int HIT_DROP = 300;
 const unsigned long SETTLE_MS = 250;      // ignore the LDR while the target is still swinging up
 const unsigned long LASER_AFTERGLOW_MS = 20; // LDR settle time after a flash before learning room light
 const bool LDR_TEST_MODE = false;         // true = calibration mode (see the guide)
+
+// Test games are kept in the ESP32's file but hidden from the leaderboard and
+// never uploaded. A game counts as a test if its name contains "TEST" or it has
+// no skill badge (old games from before 19 Nov, or a game with zero shots).
+// Tip: type TEST as the name whenever you just want to try something.
+const bool HIDE_TEST_GAMES = true;
 const bool DEBUG_HITS = false;            // true = print each standing target's light reading during a game
 
 // --- Rounds ---
@@ -282,6 +288,7 @@ unsigned long winReact[FUZZY_WINDOW];
 int   winCount = 0, winPos = 0;
 float difficulty = 0;                // fuzzy output, -1..+1
 float speedFactor = 1.0;             // multiplies target time and pause time
+unsigned long lastSaveMs = 0;      // when the last name was saved (for the upload timer)
 int   lastSkill = -1;                // K-Means label of the last finished game (-1 = none yet)
 int baseline[NUM_TARGETS];
 
@@ -453,6 +460,11 @@ float trap(float x, float a, float b, float c, float d) {
   if (x >= b && x <= c) return 1;
   if (x < b) return (b > a) ? (x - a) / (b - a) : 1;
   return (d > c) ? (d - x) / (d - c) : 1;
+}
+
+// Test game = name contains TEST, or no skill badge (see HIDE_TEST_GAMES).
+bool isTestGame(const char* name, int skill) {
+  return HIDE_TEST_GAMES && (strstr(name, "TEST") != nullptr || skill < 0);
 }
 
 // IS Feature 3: label the finished game with the nearest K-Means group center
@@ -891,12 +903,17 @@ void saveResult(String rawName) {
   String name = cleanName(rawName);
   String line = resultLine(gameId, name);
   appendToFile(SCORES_FILE, line);    // permanent local copy (survives power loss)
-  appendToFile(PENDING_FILE, line);   // waiting to be uploaded to Supabase
-  pendingCount++;
-  totalGames++;
-  addToTop(gameId, name.c_str(), score, shots, hits, totalGames, lastSkill);
-  addRecent(gameId, name.c_str(), score, shots, hits, totalGames, lastSkill);
+  if (isTestGame(name.c_str(), lastSkill)) {
+    Serial.println("Test game: saved on the ESP32 only (hidden, not uploaded).");
+  } else {
+    appendToFile(PENDING_FILE, line);   // waiting to be uploaded to Supabase
+    pendingCount++;
+    totalGames++;
+    addToTop(gameId, name.c_str(), score, shots, hits, totalGames, lastSkill);
+    addRecent(gameId, name.c_str(), score, shots, hits, totalGames, lastSkill);
+  }
   strncpy(lastSavedId, gameId, sizeof(lastSavedId));
+  lastSaveMs = millis();
   Serial.printf("Saved: %s - %d points\n", name.c_str(), score);
   PLAY(SND_SAVED);
   allTargetsUp();     // ready for the next player
@@ -913,8 +930,9 @@ void loadScores() {
       String l = f.readStringUntil('\n');
       SavedGame g;
       if (parseSavedLine(l, g)) {
-        totalGames++;
         int sk = g.extra ? classifyValues(g.ht, g.sh, g.missed, g.react, false) : -1;   // label older games too
+        if (isTestGame(g.name, sk)) continue;   // hidden from the leaderboard
+        totalGames++;
         addToTop(g.id, g.name, g.sc, g.sh, g.ht, totalGames, sk);
         addRecent(g.id, g.name, g.sc, g.sh, g.ht, totalGames, sk);
       }
@@ -939,9 +957,13 @@ bool uploadLine(const String& line) {
     Serial.println("Skipping a broken saved line.");
     return true;
   }
+  if (isTestGame(g.name, g.extra ? classifyValues(g.ht, g.sh, g.missed, g.react, false) : -1)) {
+    return true;   // test game: never upload (counts as done)
+  }
   const char* name = g.name;
   int sc = g.sc;
 
+  unsigned long t0 = millis();   // upload timer starts (connect + send + reply)
   WiFiClientSecure client;
   client.setInsecure();   // OK for a school project; skips certificate checking
   HTTPClient http;
@@ -978,15 +1000,23 @@ bool uploadLine(const String& line) {
   String resp = (code > 0) ? http.getString() : "";
   http.end();
 
+  unsigned long took = millis() - t0;
+
   if (code == 200 || code == 201 || code == 204) {
     Serial.printf("Uploaded %s (%d) to Supabase\n", name, sc);
+    Serial.printf("[UPLOAD] took %lu ms (%.2f s)", took, took / 1000.0);
+    if (strcmp(g.id, lastSavedId) == 0 && lastSaveMs > 0) {
+      unsigned long total = millis() - lastSaveMs;
+      Serial.printf(" | %.2f s after the name was saved", total / 1000.0);
+    }
+    Serial.println();
     return true;
   }
   if (code == 409) {   // already uploaded before (game_id is unique)
     Serial.printf("%s was already in Supabase\n", name);
     return true;
   }
-  Serial.printf("Supabase upload failed (code %d) %s\n", code, resp.c_str());
+  Serial.printf("Supabase upload failed (code %d) after %lu ms %s\n", code, took, resp.c_str());
   if (code == 401) Serial.println("  -> Check SUPABASE_KEY.");
   if (code == 404) Serial.println("  -> Check SUPABASE_URL and that the table is named 'scores'.");
   if (code == 403 || resp.indexOf("42501") >= 0) Serial.println("  -> Run the SQL policy step in the guide.");
@@ -1181,6 +1211,9 @@ h2.list-title{font:700 26px/1.1 "Barlow Condensed",sans-serif;margin-bottom:14px
 #conn{position:fixed;right:14px;bottom:10px;font-size:12px;color:#f3c9c4;opacity:.8}
 #sound{position:fixed;left:14px;bottom:10px;height:40px;padding:0 16px;border-radius:var(--r-sm);border:0;background:var(--ink);color:var(--paper);font:500 15px "Barlow",sans-serif;cursor:pointer;transition:background-color .3s ease-in-out,color .3s ease-in-out}
 #sound:hover{background:var(--bulb);color:var(--ink)}
+#music{position:fixed;left:14px;bottom:10px;height:40px;padding:0 16px;border-radius:var(--r-sm);border:0;background:var(--ink);color:var(--paper);font:500 15px "Barlow",sans-serif;cursor:pointer;transition:background-color .3s ease-in-out,color .3s ease-in-out}
+#music:hover{background:var(--bulb);color:var(--ink)}
+#music[hidden]{display:none}
 
 /* ---------- phones ---------- */
 @media(max-width:600px){
@@ -1205,7 +1238,7 @@ h2.list-title{font:700 26px/1.1 "Barlow Condensed",sans-serif;margin-bottom:14px
   .swap button{height:48px;font-size:19px}
   .ticket{padding:30px 20px 20px}
   /* corner info goes into the page flow so nothing covers the game */
-  #sound{position:static;display:block;margin:16px auto 0}
+  #sound,#music{position:static;display:block;margin:16px auto 0}
   #conn{position:static;text-align:center;padding:10px 12px 16px}
 }
 /* phones held sideways / short screens */
@@ -1275,6 +1308,7 @@ h2.list-title{font:700 26px/1.1 "Barlow Condensed",sans-serif;margin-bottom:14px
 </div>
 
 <button id="sound" type="button">Turn on sound</button>
+<button id="music" type="button" hidden>Music: on</button>
 <p id="conn">Connecting to the game…</p>
 
 <script>
@@ -1330,7 +1364,65 @@ function readyCue(){
 const SFX={hit(){beep(1046,.08);beep(1568,.18,.08)},tick(){beep(660,.1)},go(){beep(1320,.35)},
   over(){[523,659,784,1047].forEach((f,i)=>beep(f,.2,i*.18))},saved(){[1047,1319,1568].forEach((f,i)=>beep(f,.12,i*.1))}};
 
-$('sound').onclick=()=>{ctx=new (window.AudioContext||window.webkitAudioContext)();SFX.saved();$('sound').hidden=true};
+$('sound').onclick=()=>{ctx=new (window.AudioContext||window.webkitAudioContext)();SFX.saved();$('sound').hidden=true;$('music').hidden=false};
+
+/* ---------------- background music: original carnival waltz (3/4) ----------------
+   Calliope melody + oom-pah-pah band, made in the browser (no audio files).
+   Plays from the countdown to the end of round 3, a little faster each round. */
+const MUSIC_VOL=.35;                       // 0 = silent, 1 = loud (sound effects stay on top)
+const MUSIC_BPM=[150,162,176];             // tempo for round 1, 2, 3
+const mid=n=>440*Math.pow(2,(n-69)/12);    // note number -> Hz (60 = middle C)
+// one bar = 3 beats: [chord, melody as [note, beats] pairs]  (0 = rest)
+const C=[48,64,67,72],F=[41,65,69,72],G=[43,62,65,71];
+const SONG=[
+ [C,[[67,1],[72,1],[76,1]]],        [C,[[79,2],[76,1]]],
+ [G,[[77,1],[74,1],[71,1]]],        [G,[[67,2],[74,1]]],
+ [G,[[71,1],[74,1],[77,1]]],        [G,[[81,2],[79,1]]],
+ [C,[[76,1],[75,.5],[76,.5],[79,1]]],[C,[[84,2],[0,1]]],
+ [C,[[84,1],[83,.5],[81,.5],[79,1]]],[C,[[76,2],[72,1]]],
+ [F,[[81,1],[80,.5],[81,.5],[84,1]]],[F,[[77,2],[81,1]]],
+ [C,[[79,1],[76,1],[72,1]]],        [G,[[74,1],[77,1],[71,1]]],
+ [G,[[74,1.5],[76,.5],[74,1]]],     [C,[[72,2],[0,1]]]];
+let musicOn=false,musicBus=null,bar=0,nextBar=0,spb=.4,musicMuted=false;
+
+function calliope(n,t,d){   // breathy organ pipe with a wobble
+  const f=mid(n),o=ctx.createOscillator(),o2=ctx.createOscillator(),g=ctx.createGain(),v=ctx.createOscillator(),vg=ctx.createGain();
+  o.type='triangle';o2.type='square';o.frequency.value=f;o2.frequency.value=f*2;
+  v.frequency.value=6.5;vg.gain.value=f*.012;v.connect(vg);vg.connect(o.frequency);vg.connect(o2.frequency);
+  const g2=ctx.createGain();g2.gain.value=.18;
+  g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.22,t+.02);
+  g.gain.setValueAtTime(.2,t+d*.75);g.gain.exponentialRampToValueAtTime(.0001,t+d*.98);
+  o.connect(g);o2.connect(g2);g2.connect(g);g.connect(musicBus);
+  [o,o2,v].forEach(x=>{x.start(t);x.stop(t+d)});
+}
+function band(n,t,d,type,vol){   // bass "oom" and chord "pah"
+  const o=ctx.createOscillator(),g=ctx.createGain();o.type=type;o.frequency.value=mid(n);
+  g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(.0001,t+d);
+  o.connect(g);g.connect(musicBus);o.start(t);o.stop(t+d+.02);
+}
+function scheduleBar(t){
+  const [ch,mel]=SONG[bar%SONG.length];
+  band(ch[0]-12*(bar%2),t,spb*.9,'triangle',.5);                  // oom (bass alternates octave)
+  for(const b of [1,2])for(const n of ch.slice(1))band(n,t+b*spb,spb*.35,'square',.035);   // pah pah
+  let x=t;for(const [n,b] of mel){if(n)calliope(n,x,b*spb);x+=b*spb}
+  bar++;
+}
+function startMusic(round){
+  if(!ctx||musicMuted)return;
+  spb=60/MUSIC_BPM[Math.min(2,Math.max(0,(round||1)-1))];
+  if(musicOn)return;
+  musicOn=true;bar=0;nextBar=ctx.currentTime+.05;
+  musicBus=ctx.createGain();musicBus.gain.value=MUSIC_VOL*.5;musicBus.connect(ctx.destination);
+}
+function stopMusic(){
+  if(!musicOn)return;musicOn=false;
+  const b=musicBus,t=ctx.currentTime;b.gain.setValueAtTime(b.gain.value,t);b.gain.linearRampToValueAtTime(0,t+.4);
+  setTimeout(()=>b.disconnect(),600);
+}
+setInterval(()=>{if(!ctx||!musicOn)return;while(nextBar<ctx.currentTime+.3){scheduleBar(nextBar);nextBar+=3*spb}},50);
+$('music').onclick=()=>{musicMuted=!musicMuted;$('music').textContent=musicMuted?'Music: off':'Music: on';
+  if(musicMuted)stopMusic();else if(last&&['COUNTDOWN','ROUND','BREAK'].includes(last.state))startMusic(last.round)};
+
 
 function pop(t){const p=$('pop');p.textContent=t;p.classList.remove('go');void p.offsetWidth;p.classList.add('go')}
 
@@ -1410,6 +1502,9 @@ function render(s){
   }
   if(!playing)stopCharge();
 
+  // background music while someone is playing (countdown, rounds and breaks)
+  if(['COUNTDOWN','ROUND','BREAK'].includes(s.state))startMusic(s.round);else stopMusic();
+
   if(lastSeq>=0&&s.hitSeq>lastSeq){
     SFX.hit();pop('+'+s.lastHitPts);
     const t=lis[s.lastHitTarget];
@@ -1486,7 +1581,8 @@ $('nameForm').onsubmit=async ev=>{
 
 setInterval(loadBoard,5000);loadBoard();poll();
 </script>
-</body></html>)HTML";
+</body></html>
+)HTML";
 
 void handleRoot() {
   server.send_P(200, "text/html", DASHBOARD_HTML);

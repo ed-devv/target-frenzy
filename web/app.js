@@ -73,10 +73,12 @@ function accuracy(r) {
 async function refresh() {
   try {
     const cols = "id,player_name,score,shots,hits,skill,created_at";
+    // Real games only: must have a skill badge and no "TEST" in the name
+    const real = "&skill=not.is.null&player_name=not.ilike.*TEST*";
     const [topRes, recentRes, countRes] = await Promise.all([
-      query("scores?select=" + cols + "&order=score.desc,created_at.asc&limit=10"),
-      query("scores?select=" + cols + "&order=created_at.desc&limit=8"),
-      query("scores?select=id&limit=1", { Prefer: "count=exact" })
+      query("scores?select=" + cols + real + "&order=score.desc,created_at.asc&limit=10"),
+      query("scores?select=" + cols + real + "&order=created_at.desc&limit=8"),
+      query("scores?select=id" + real + "&limit=1", { Prefer: "count=exact" })
     ]);
     const top = await topRes.json();
     const recent = await recentRes.json();
